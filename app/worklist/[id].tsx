@@ -1,0 +1,286 @@
+import React, { useState } from 'react';
+import { 
+  StyleSheet, Text, View, FlatList, TouchableOpacity, TextInput, Modal, Alert, Image, ActivityIndicator 
+} from 'react-native';
+import { useLocalSearchParams, useRouter, Stack } from 'expo-router';
+import { useAppContext, WorklistItem } from '../../context/AppContext';
+import { FontAwesome, MaterialIcons, Ionicons } from '@expo/vector-icons';
+import { SafeAreaView } from 'react-native-safe-area-context';
+import * as ImagePicker from 'expo-image-picker';
+import * as Print from 'expo-print';
+import * as Sharing from 'expo-sharing';
+import * as FileSystem from 'expo-file-system/legacy';
+// 1. IMPORT THE MANIPULATOR
+import * as ImageManipulator from 'expo-image-manipulator';
+
+export default function WorklistDetailScreen() {
+  const { id } = useLocalSearchParams();
+  const router = useRouter();
+  const { 
+    worklistGroups, 
+    worklistItems, 
+    addWorklistItem, 
+    updateWorklistItem, 
+    deleteWorklistItem 
+  } = useAppContext();
+
+  const currentGroup = worklistGroups.find(g => g.id === id);
+  const currentItems = worklistItems.filter(i => i.listId === id);
+
+  const [modalVisible, setModalVisible] = useState(false);
+  const [editingItem, setEditingItem] = useState<WorklistItem | null>(null);
+  const [newItemDesc, setNewItemDesc] = useState('');
+  const [newItemImage, setNewItemImage] = useState<string | null>(null);
+  const [generatingPdf, setGeneratingPdf] = useState(false);
+
+  // --- OPEN MODAL LOGIC ---
+  const openAddModal = () => {
+    setEditingItem(null);
+    setNewItemDesc('');
+    setNewItemImage(null);
+    setModalVisible(true);
+  };
+
+  const openEditModal = (item: WorklistItem) => {
+    setEditingItem(item);
+    setNewItemDesc(item.description);
+    setNewItemImage(item.imageUri === 'placeholder' ? null : item.imageUri);
+    setModalVisible(true);
+  };
+
+  // --- CAMERA (COMPRESSION MODE) ---
+  const takePhoto = async () => {
+    try {
+      // 1. Snap the photo
+      const result = await ImagePicker.launchCameraAsync({
+        mediaTypes: ImagePicker.MediaTypeOptions.Images,
+        allowsEditing: false, // Fast snap
+        quality: 1, // Get full quality initially so we can resize cleanly
+      });
+
+      if (!result.canceled && result.assets[0].uri) {
+        // 2. Resize and Compress immediately
+        const manipResult = await ImageManipulator.manipulateAsync(
+          result.assets[0].uri,
+          [{ resize: { width: 800 } }], // Resize width to 800px (standard document width)
+          { compress: 0.5, format: ImageManipulator.SaveFormat.JPEG } // Compress file size
+        );
+        
+        // 3. Save the SMALL version
+        setNewItemImage(manipResult.uri);
+      }
+    } catch (e) {
+      Alert.alert("Camera Error", "Could not process image.");
+    }
+  };
+
+  // --- SAVE LOGIC ---
+  const handleSaveItem = () => {
+    if (!newItemDesc.trim()) return;
+
+    if (editingItem) {
+      updateWorklistItem(editingItem.id, {
+        description: newItemDesc,
+        imageUri: newItemImage || 'placeholder'
+      });
+    } else {
+      addWorklistItem({
+        listId: id as string,
+        description: newItemDesc,
+        imageUri: newItemImage || 'placeholder', 
+      });
+    }
+
+    setModalVisible(false);
+    setEditingItem(null);
+    setNewItemDesc('');
+    setNewItemImage(null);
+  };
+
+  const handleDeleteItem = () => {
+    if (editingItem) {
+      deleteWorklistItem(editingItem.id);
+      setModalVisible(false);
+    }
+  };
+
+  // --- PDF GENERATION ENGINE ---
+  const generatePDF = async () => {
+    if (currentItems.length === 0) return null;
+    
+    const processedItems = await Promise.all(currentItems.map(async (item) => {
+      let imageHtml = '';
+      if (item.imageUri && item.imageUri !== 'placeholder') {
+        try {
+          const base64 = await FileSystem.readAsStringAsync(item.imageUri, { encoding: 'base64' });
+          imageHtml = `<img src="data:image/jpeg;base64,${base64}" style="width: 100px; height: 100px; object-fit: cover; border-radius: 8px; margin-right: 15px;" />`;
+        } catch (err) {
+          imageHtml = `<div style="width: 100px; height: 100px; background: #eee; border-radius: 8px; margin-right: 15px;">Error</div>`;
+        }
+      }
+      return `
+        <div style="display: flex; border-bottom: 1px solid #ccc; padding: 15px 0;">
+          ${imageHtml}
+          <div style="flex: 1;">
+            <p style="font-size: 18px; font-family: Helvetica; color: #333;">${item.description}</p>
+          </div>
+        </div>
+      `;
+    }));
+
+    const html = `
+      <html>
+        <head><style>body { padding: 40px; font-family: Helvetica; }</style></head>
+        <body>
+          <h1 style="color: #004990;">Lowe's Store Walk: ${currentGroup?.name}</h1>
+          <p><strong>Date:</strong> ${new Date().toLocaleDateString()}</p>
+          <hr />
+          ${processedItems.join('')}
+          <div style="margin-top: 50px; text-align: center; color: #888;">Generated by ASM Tools</div>
+        </body>
+      </html>
+    `;
+
+    try {
+      const { uri } = await Print.printToFileAsync({ html });
+      const sanitizedName = currentGroup?.name.replace(/[^a-zA-Z0-9]/g, '_') || 'Worklist';
+      const newFilename = `${sanitizedName}.pdf`;
+      const newPath = `${FileSystem.documentDirectory}${newFilename}`;
+      await FileSystem.moveAsync({ from: uri, to: newPath });
+      return newPath;
+    } catch (err) {
+      throw new Error(`PDF Gen Failed`);
+    }
+  };
+
+  const handleSharePDF = async () => {
+    setGeneratingPdf(true);
+    try {
+      const uri = await generatePDF();
+      if (uri) await Sharing.shareAsync(uri, { mimeType: 'application/pdf' });
+    } catch (e) { Alert.alert("Error", "Could not generate PDF"); }
+    finally { setGeneratingPdf(false); }
+  };
+
+  const handleRecapToCoaching = async () => {
+    if (currentItems.length === 0) return;
+    setGeneratingPdf(true);
+    try {
+      const pdfUri = await generatePDF();
+      const issuesFound = currentItems.map(i => `- ${i.description}`).join('\n');
+      const promptData = `I performed a ${currentGroup?.name} walk. Issues found:\n${issuesFound}\nPlease write a directive email to the Department Supervisor (DS). The full photo report is attached.`;
+      router.push({ pathname: '/(tabs)/coaching', params: { autoFill: promptData, attachment: pdfUri } });
+    } catch (e) { Alert.alert("Error", "Failed to prepare report."); }
+    finally { setGeneratingPdf(false); }
+  };
+
+  if (!currentGroup) return <View style={styles.container}><Text>List not found</Text></View>;
+
+  return (
+    <SafeAreaView style={styles.container}>
+      <Stack.Screen options={{ title: currentGroup.name }} />
+      
+      <View style={styles.header}>
+        <Text style={styles.title}>{currentGroup.name}</Text>
+        <Text style={styles.subtitle}>{currentItems.length} Items Logged</Text>
+      </View>
+
+      <FlatList
+        data={currentItems}
+        keyExtractor={item => item.id}
+        renderItem={({ item }) => (
+          <TouchableOpacity onPress={() => openEditModal(item)}>
+            <View style={styles.itemCard}>
+              <View style={styles.itemIcon}>
+                 {item.imageUri && item.imageUri !== 'placeholder' ? (
+                     <Image source={{ uri: item.imageUri }} style={styles.thumbnail} />
+                 ) : (
+                     <FontAwesome name="camera" size={20} color="#fff" />
+                 )}
+              </View>
+              <Text style={styles.itemText}>{item.description}</Text>
+              <FontAwesome name="pencil" size={16} color="#ccc" />
+            </View>
+          </TouchableOpacity>
+        )}
+        contentContainerStyle={{ padding: 15, paddingBottom: 100 }}
+      />
+
+      <View style={styles.footerContainer}>
+        <View style={styles.exportRow}>
+          <TouchableOpacity style={styles.secondaryBtn} onPress={handleSharePDF} disabled={generatingPdf}>
+             {generatingPdf ? <ActivityIndicator size="small" color="#666" /> : <FontAwesome name="file-pdf-o" size={18} color="#666" />}
+             <Text style={styles.secondaryBtnText}> PDF Only</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity style={styles.secondaryBtn} onPress={handleRecapToCoaching} disabled={generatingPdf}>
+            {generatingPdf ? <ActivityIndicator size="small" color="#666" /> : <MaterialIcons name="auto-fix-high" size={20} color="#666" />}
+            <Text style={styles.secondaryBtnText}> Recap + PDF</Text>
+          </TouchableOpacity>
+        </View>
+
+        <TouchableOpacity style={styles.mainAddButton} onPress={openAddModal}>
+          <FontAwesome name="camera" size={24} color="#fff" style={{marginRight: 10}} />
+          <Text style={styles.mainAddButtonText}>Add New Issue</Text>
+        </TouchableOpacity>
+      </View>
+
+      {/* MODAL */}
+      <Modal visible={modalVisible} transparent animationType="slide">
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalContent}>
+            <View style={{flexDirection:'row', justifyContent:'space-between', alignItems:'center'}}>
+                <Text style={styles.modalTitle}>{editingItem ? "Edit Issue" : "Log Issue"}</Text>
+                <View style={{flexDirection:'row'}}>
+                   {editingItem && (
+                     <TouchableOpacity onPress={handleDeleteItem} style={{marginRight: 15}}>
+                       <FontAwesome name="trash-o" size={24} color="#dc3545" />
+                     </TouchableOpacity>
+                   )}
+                   <TouchableOpacity onPress={() => setModalVisible(false)}>
+                       <Ionicons name="close" size={24} color="#333" />
+                   </TouchableOpacity>
+                </View>
+            </View>
+            
+            <TouchableOpacity style={styles.photoUpload} onPress={takePhoto}>
+                {newItemImage ? <Image source={{ uri: newItemImage }} style={styles.previewImage} /> : (
+                    <View style={{alignItems:'center'}}><FontAwesome name="camera" size={30} color="#004990" /><Text>Tap to Snap (Fast Mode)</Text></View>
+                )}
+            </TouchableOpacity>
+
+            <TextInput style={styles.input} placeholder="Describe issue..." value={newItemDesc} onChangeText={setNewItemDesc} multiline />
+            
+            <TouchableOpacity onPress={handleSaveItem} style={styles.confirmBtn}>
+              <Text style={{color: '#fff', fontWeight:'bold', fontSize: 18}}>{editingItem ? "Update Changes" : "Save Issue"}</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+    </SafeAreaView>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: '#f5f7fa' },
+  header: { padding: 20, backgroundColor: '#fff', borderBottomWidth: 1, borderColor: '#eee' },
+  title: { fontSize: 24, fontWeight: 'bold', color: '#004990' },
+  subtitle: { fontSize: 14, color: '#666', marginTop: 5 },
+  itemCard: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#fff', padding: 15, borderRadius: 10, marginBottom: 10, elevation: 1 },
+  itemIcon: { width: 50, height: 50, borderRadius: 8, backgroundColor: '#ccc', justifyContent: 'center', alignItems: 'center', marginRight: 15, overflow: 'hidden' },
+  thumbnail: { width: '100%', height: '100%' },
+  itemText: { fontSize: 16, color: '#333', flex: 1 },
+  footerContainer: { padding: 20, backgroundColor: '#fff', borderTopWidth: 1, borderColor: '#eee' },
+  exportRow: { flexDirection: 'row', gap: 15, marginBottom: 15 },
+  secondaryBtn: { flex: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', backgroundColor: '#f0f0f0', padding: 12, borderRadius: 8 },
+  secondaryBtnText: { color: '#666', fontWeight: '600', marginLeft: 5 },
+  mainAddButton: { backgroundColor: '#004990', flexDirection: 'row', alignItems: 'center', justifyContent: 'center', padding: 18, borderRadius: 12, shadowColor: '#004990', shadowOpacity: 0.3, shadowRadius: 5, elevation: 4 },
+  mainAddButtonText: { color: '#fff', fontSize: 20, fontWeight: 'bold' },
+  modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'flex-end' },
+  modalContent: { backgroundColor: '#fff', borderTopLeftRadius: 20, borderTopRightRadius: 20, padding: 20, minHeight: 450 },
+  modalTitle: { fontSize: 20, fontWeight: 'bold', marginBottom: 15 },
+  photoUpload: { height: 180, backgroundColor: '#e6f0ff', borderRadius: 10, justifyContent: 'center', alignItems: 'center', marginBottom: 20, borderStyle: 'dashed', borderWidth: 1, borderColor: '#004990' },
+  previewImage: { width: '100%', height: '100%', borderRadius: 10, resizeMode: 'cover' },
+  input: { backgroundColor: '#f0f0f0', borderRadius: 8, padding: 15, height: 80, textAlignVertical: 'top', fontSize: 16, marginBottom: 20 },
+  confirmBtn: { backgroundColor: '#004990', padding: 18, borderRadius: 8, alignItems: 'center' },
+});
